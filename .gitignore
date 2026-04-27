@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+uploads/*.zip
+uploads/*.xlsx
+cache/embeddings/*.npy
+static/charts/*/
+.DS_Store
+.ipynb_checkpoints/

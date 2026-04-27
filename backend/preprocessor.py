@@ -1,202 +1,177 @@
 """
 ==========================================================
-  STAGE 1: DATA PRE-PROCESSOR
-  Input  : ZIP file containing PDF resumes
-  Output : Clean Excel file (Resume_ID, Resume_Text, Email,
-           Phone, Exp_Years, Skills_List)
+  STAGE 1: DATA PRE-PROCESSOR (Cloud-Native)
+  Input  : ZIP file (BytesIO or path) containing PDF resumes
+  Output : pandas.DataFrame with columns:
+           [Resume_ID, Resume_Text, Email, Phone,
+            Exp_Years, Skills_List, Source_File]
 ==========================================================
 """
 
-# !pip install -q pymupdf openpyxl pandas
-
-import os
+import io
 import re
 import zipfile
-import shutil
-import tempfile
-import unicodedata
+import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Union, List, Dict, Optional
 
-import fitz  # PyMuPDF
 import pandas as pd
+import fitz  # PyMuPDF
 
-# ==========================================================
-# CONFIG
-# ==========================================================
-OUTPUT_EXCEL = "processed_resumes.xlsx"
-EXTRACT_DIR = "extracted_pdfs"
-
-# Skills dictionary (extend as needed)
-SKILLS_VOCAB = [
-    "python", "java", "c++", "c#", "javascript", "typescript", "go", "rust",
-    "sql", "mysql", "postgresql", "mongodb", "redis", "oracle",
-    "machine learning", "deep learning", "nlp", "computer vision",
-    "tensorflow", "pytorch", "keras", "scikit-learn", "pandas", "numpy",
-    "data analysis", "data science", "statistics", "power bi", "tableau",
-    "aws", "azure", "gcp", "docker", "kubernetes", "linux", "git",
-    "react", "angular", "vue", "node.js", "django", "flask", "fastapi",
-    "spring", "rest api", "graphql", "microservices", "ci/cd",
-    "html", "css", "tailwind", "sass",
-    "excel", "communication", "leadership", "project management", "agile", "scrum",
-]
-
-# ==========================================================
-# 1. ILLEGAL CHARACTER SANITIZATION
-# ==========================================================
-# openpyxl rejects characters in these ranges (XML 1.0 illegal chars)
-ILLEGAL_CHARS_RE = re.compile(
-    r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]'
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
+logger = logging.getLogger("pdf_processor")
 
-def sanitize_text(text: str) -> str:
-    """Remove illegal characters & normalize unicode for Excel safety."""
-    if text is None:
-        return ""
-    text = str(text)
-    # Normalize unicode (NFKC handles ligatures, weird spaces, etc.)
-    text = unicodedata.normalize("NFKC", text)
-    # Remove illegal control characters
-    text = ILLEGAL_CHARS_RE.sub(" ", text)
-    # Collapse excessive whitespace but preserve line breaks
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-# ==========================================================
-# 2. PDF TEXT EXTRACTION
-# ==========================================================
-def extract_pdf_text(pdf_path: str) -> str:
-    """Extract raw text from a PDF file using PyMuPDF."""
-    try:
-        doc = fitz.open(pdf_path)
-        pages = []
-        for page in doc:
-            pages.append(page.get_text("text"))
-        doc.close()
-        return "\n".join(pages)
-    except Exception as e:
-        print(f"⚠️  Failed to read {pdf_path}: {e}")
-        return ""
-
-# ==========================================================
-# 3. FIELD EXTRACTION (Name, Email, Phone, Experience, Skills)
-# ==========================================================
+# ---------- Constants ----------
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-PHONE_RE = re.compile(
-    r"(\+?\d{1,3}[\s-]?)?(\(?\d{2,4}\)?[\s-]?)?\d{3,4}[\s-]?\d{3,4}"
-)
+PHONE_RE = re.compile(r"(\+?\d[\d\s\-\(\)]{7,}\d)")
 EXP_PATTERNS = [
-    re.compile(r"(\d{1,2})\+?\s*(?:years?|yrs?)\s*(?:of)?\s*experience", re.I),
-    re.compile(r"experience\s*[:\-]?\s*(\d{1,2})\+?\s*(?:years?|yrs?)", re.I),
-    re.compile(r"(\d{1,2})\+?\s*(?:years?|yrs?)", re.I),
+    re.compile(r"(\d+)\s*\+?\s*(?:years?|yrs?)\s+(?:of\s+)?experience", re.I),
+    re.compile(r"experience[:\s]+(\d+)\s*\+?\s*(?:years?|yrs?)", re.I),
+    re.compile(r"(\d+)\s*\+\s*(?:years?|yrs?)", re.I),
 ]
 
-def extract_email(text: str) -> str:
+# Common technical skills dictionary (extend as needed)
+SKILLS_VOCAB = {
+    "python", "java", "javascript", "typescript", "c++", "c#", "go", "rust",
+    "sql", "nosql", "mongodb", "postgresql", "mysql", "redis",
+    "machine learning", "deep learning", "nlp", "computer vision",
+    "tensorflow", "pytorch", "scikit-learn", "keras", "pandas", "numpy",
+    "aws", "azure", "gcp", "docker", "kubernetes", "terraform",
+    "react", "angular", "vue", "node.js", "django", "flask", "fastapi",
+    "git", "linux", "bash", "ci/cd", "agile", "scrum",
+    "tableau", "power bi", "excel", "spark", "hadoop", "kafka",
+    "data analysis", "data science", "statistics", "etl",
+}
+
+
+# ============================================================
+#  CORE EXTRACTION FUNCTIONS
+# ============================================================
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Extract raw text from PDF bytes using PyMuPDF."""
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return "\n".join(page.get_text() for page in doc)
+    except Exception as e:
+        logger.warning(f"PDF extraction failed: {e}")
+        return ""
+
+
+def extract_email(text: str) -> Optional[str]:
     m = EMAIL_RE.search(text)
-    return m.group(0) if m else ""
+    return m.group(0).lower() if m else None
 
-def extract_phone(text: str) -> str:
-    for m in PHONE_RE.finditer(text):
-        candidate = re.sub(r"\D", "", m.group(0))
-        if 8 <= len(candidate) <= 15:
-            return m.group(0).strip()
-    return ""
 
-def extract_experience_years(text: str) -> float:
+def extract_phone(text: str) -> Optional[str]:
+    m = PHONE_RE.search(text)
+    if not m:
+        return None
+    phone = re.sub(r"[\s\-\(\)]", "", m.group(0))
+    return phone if 8 <= len(re.sub(r"\D", "", phone)) <= 15 else None
+
+
+def extract_experience_years(text: str) -> int:
+    """Return the maximum years of experience mentioned, else 0."""
     years = []
     for pat in EXP_PATTERNS:
-        for m in pat.finditer(text):
-            try:
-                y = int(m.group(1))
-                if 0 <= y <= 50:
-                    years.append(y)
-            except (ValueError, IndexError):
-                continue
-    return float(max(years)) if years else 0.0
+        years.extend(int(x) for x in pat.findall(text) if x.isdigit())
+    return max(years) if years else 0
 
-def extract_name(text: str, fallback: str) -> str:
-    """Heuristic: first non-empty line that looks like a name."""
-    for line in text.splitlines()[:10]:
-        line = line.strip()
-        if not line or len(line) > 60:
-            continue
-        if EMAIL_RE.search(line) or any(ch.isdigit() for ch in line):
-            continue
-        words = line.split()
-        if 2 <= len(words) <= 5 and all(w[0].isupper() for w in words if w):
-            return line
-    return fallback
 
 def extract_skills(text: str) -> List[str]:
-    text_low = text.lower()
-    found = []
-    for skill in SKILLS_VOCAB:
-        # Word-boundary match for short skills, substring for multi-word
-        pattern = r"\b" + re.escape(skill) + r"\b"
-        if re.search(pattern, text_low):
-            found.append(skill)
-    return sorted(set(found))
+    """Match skills from vocabulary against resume text."""
+    text_lower = text.lower()
+    found = {skill for skill in SKILLS_VOCAB if skill in text_lower}
+    return sorted(found)
 
-# ==========================================================
-# 4. ZIP HANDLING
-# ==========================================================
-def unzip_resumes(zip_path: str, extract_dir: str) -> List[str]:
-    """Extract ZIP and return list of PDF paths."""
-    if os.path.exists(extract_dir):
-        shutil.rmtree(extract_dir)
-    os.makedirs(extract_dir, exist_ok=True)
 
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(extract_dir)
+def clean_text(text: str) -> str:
+    """Normalize whitespace and remove control chars."""
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\x20-\x7E\n]", " ", text)
+    return text.strip()
 
-    pdf_paths = []
-    for root, _, files in os.walk(extract_dir):
-        for f in files:
-            if f.lower().endswith(".pdf"):
-                pdf_paths.append(os.path.join(root, f))
-    return sorted(pdf_paths)
 
-# ==========================================================
-# 5. MAIN PIPELINE
-# ==========================================================
-def process_pdfs_to_excel(zip_path: str,
-                           output_excel: str = OUTPUT_EXCEL,
-                           extract_dir: str = EXTRACT_DIR) -> str:
+# ============================================================
+#  MAIN PIPELINE
+# ============================================================
+
+def process_single_pdf(filename: str, pdf_bytes: bytes, idx: int) -> Optional[Dict]:
+    """Process one PDF and return a structured row."""
+    raw_text = extract_text_from_pdf(pdf_bytes)
+    if not raw_text or len(raw_text.strip()) < 50:
+        logger.warning(f"Skipping {filename}: insufficient text")
+        return None
+
+    cleaned = clean_text(raw_text)
+    return {
+        "Resume_ID": f"R{idx:04d}",
+        "Source_File": filename,
+        "Resume_Text": cleaned,
+        "Email": extract_email(raw_text) or "",
+        "Phone": extract_phone(raw_text) or "",
+        "Exp_Years": extract_experience_years(raw_text),
+        "Skills_List": ", ".join(extract_skills(raw_text)),
+    }
+
+
+def process_zip(zip_input: Union[str, Path, bytes, io.BytesIO]) -> pd.DataFrame:
     """
-    Full pipeline: ZIP -> PDFs -> Excel.
-    Returns the path of the generated Excel file.
+    Main entry point.
+    Accepts a path, raw bytes, or BytesIO (from Streamlit's file_uploader).
+    Returns a clean DataFrame.
     """
-    print(f"📂 Unzipping: {zip_path}")
-    pdf_paths = unzip_resumes(zip_path, extract_dir)
-    print(f"   Found {len(pdf_paths)} PDF files.")
-
-    if not pdf_paths:
-        raise ValueError("No PDF files found inside the ZIP archive.")
+    # Normalize input to a ZipFile object
+    if isinstance(zip_input, (str, Path)):
+        zf_source = str(zip_input)
+    elif isinstance(zip_input, bytes):
+        zf_source = io.BytesIO(zip_input)
+    elif isinstance(zip_input, io.BytesIO):
+        zf_source = zip_input
+    else:
+        # Streamlit UploadedFile has .read()
+        zf_source = io.BytesIO(zip_input.read())
 
     rows = []
-    for idx, pdf_path in enumerate(pdf_paths, start=1):
-        filename = Path(pdf_path).stem
-        raw_text = extract_pdf_text(pdf_path)
-        clean = sanitize_text(raw_text)
+    with zipfile.ZipFile(zf_source, "r") as zf:
+        pdf_names = [n for n in zf.namelist()
+                     if n.lower().endswith(".pdf") and not n.startswith("__MACOSX")]
+        logger.info(f"Found {len(pdf_names)} PDF(s) in archive")
 
-        if not clean:
-            print(f"   ⚠️  Skipped empty PDF: {filename}")
-            continue
+        for idx, name in enumerate(pdf_names, start=1):
+            try:
+                with zf.open(name) as f:
+                    pdf_bytes = f.read()
+                row = process_single_pdf(Path(name).name, pdf_bytes, idx)
+                if row:
+                    rows.append(row)
+            except Exception as e:
+                logger.error(f"Failed to process {name}: {e}")
 
-        rows.append({
-            "Resume_ID": f"R{idx:04d}",
-            "File_Name": sanitize_text(filename),
-            "Candidate_Name": sanitize_text(extract_name(clean, filename)),
-            "Email": sanitize_text(extract_email(clean)),
-            "Phone": sanitize_text(extract_phone(clean)),
-            "Exp_Years": extract_experience_years(clean),
-            "Skills_List": ", ".join(extract_skills(clean)),
-            "Resume_Text": clean,  # ORIGINAL text — no augmentation
-        })
-        print(f"   ✅ [{idx}/{len(pdf_paths)}] {filename}")
+    if not rows:
+        raise ValueError("No valid resumes were extracted from the ZIP file.")
 
     df = pd.DataFrame(rows)
-    df.to_excel(output_excel, index=False, engine="openpyxl")
-    print(f"\n💾 Saved: {output_excel}  ({len(df)} resumes)")
-    return output_excel
+    logger.info(f"Successfully processed {len(df)} resume(s)")
+    return df
+
+
+# ============================================================
+#  CLI / Standalone test
+# ============================================================
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python pdf_processor.py <path_to_zip>")
+        sys.exit(1)
+
+    df = process_zip(sys.argv[1])
+    out_path = "resumes_extracted.xlsx"
+    df.to_excel(out_path, index=False)
+    print(f"✅ Saved {len(df)} rows to {out_path}")
+    print(df.head())
